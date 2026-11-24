@@ -64,12 +64,33 @@ button:focus-visible{outline:3px solid var(--today);outline-offset:2px}
 .backup button,.backup label{flex:1;text-align:center;padding:12px;border:1px solid var(--line);border-radius:12px;background:var(--surface);color:var(--ink);font-size:.95rem}
 .backup input{display:none}
 .note{font-size:.82rem;color:var(--muted);margin:8px 2px 0}
+.auth{background:var(--surface);border:1px solid var(--line);border-radius:20px;padding:22px 20px}
+.auth h2{margin:0 0 4px;font-size:1.3rem}
+.auth p{margin:0 0 14px;color:var(--muted);font-size:.92rem}
+.auth input{width:100%;padding:13px;margin-bottom:10px;border:1px solid var(--line);border-radius:12px;background:var(--bg);color:var(--ink);font:inherit}
+.auth .row{display:flex;gap:10px}
+.auth .row button{flex:1;padding:13px;border-radius:12px;border:1px solid var(--accent);background:none;color:var(--ink);font-weight:600}
+.auth .row button.p{background:var(--accent);color:var(--on-accent)}
+.who{display:flex;justify-content:space-between;align-items:center;gap:10px;margin:-6px 0 14px;font-size:.85rem;color:var(--muted)}
+.who button{background:none;border:0;color:var(--muted);text-decoration:underline;font-size:.85rem}
 @media (prefers-reduced-motion:no-preference){.big{transition:transform .1s}.big:active{transform:scale(.98)}}
 </style>
 </head>
 <body>
 <main>
   <h1>Presença no escritório</h1>
+
+  <section class="auth" id="auth" hidden>
+    <h2>Entrar</h2>
+    <p>Entre com o mesmo e-mail e senha nos seus aparelhos para ver os mesmos dias em todos.</p>
+    <input id="email" type="email" autocomplete="email" placeholder="E-mail">
+    <input id="pass" type="password" autocomplete="current-password" placeholder="Senha (mínimo 6 caracteres)">
+    <div class="row"><button class="p" id="login">Entrar</button><button id="signup">Criar conta</button></div>
+    <p id="auth-msg" style="margin:12px 0 0" role="status"></p>
+  </section>
+
+  <div id="app" hidden>
+  <div class="who"><span id="who"></span><button id="logout">Sair</button></div>
 
   <section class="hero" aria-live="polite">
     <p class="date" id="today-label"></p>
@@ -98,34 +119,103 @@ button:focus-visible{outline:3px solid var(--today);outline-offset:2px}
     <button id="export">Exportar backup</button>
     <label tabindex="0" id="import-l">Importar backup<input type="file" id="import" accept=".json,application/json"></label>
   </div>
-  <p class="note" id="note">Seus registros ficam salvos só neste aparelho. Exporte um backup de vez em quando.</p>
+  <p class="note" id="note">Sincronizando...</p>
+  </div>
 </main>
 
 <script>
 (function(){
-  var KEY = 'presenca-escritorio';
-  var data = {};
-  try { data = JSON.parse(localStorage.getItem(KEY) || '{}') || {}; } catch (e) { data = {}; }
-  function save(){ try { localStorage.setItem(KEY, JSON.stringify(data)); } catch (e) {} }
-
-  var now = new Date();
-  var view = new Date(now.getFullYear(), now.getMonth(), 1);
+  var SB = 'https://kjluvuqaejncmgscqkli.supabase.co';
+  var KEY = 'sb_publishable_TZcOHN35ZOGMfAze0Bhzog_zPuYnaCs';
+  var SES = 'presenca-sessao', LEGACY = 'presenca-escritorio';
   var $ = function(id){ return document.getElementById(id); };
   var pad = function(n){ return String(n).padStart(2, '0'); };
   var keyOf = function(y, m, d){ return y + '-' + pad(m + 1) + '-' + pad(d); };
   var todayKey = function(){ var t = new Date(); return keyOf(t.getFullYear(), t.getMonth(), t.getDate()); };
   var WD = ['dom','seg','ter','qua','qui','sex','sáb'];
+  var now = new Date();
+  var view = new Date(now.getFullYear(), now.getMonth(), 1);
+  var session = null, data = {}, pending = [];
 
+  function lsGet(k){ try { return JSON.parse(localStorage.getItem(k)); } catch (e) { return null; } }
+  function lsSet(k, v){ try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+  function say(t){ $('note').textContent = t; }
+  function cacheKey(){ return 'presenca-' + session.user.id; }
+  function saveCache(){ lsSet(cacheKey(), {data: data, pending: pending}); }
+
+  /* ---------- Supabase (REST puro) ---------- */
+  function authCall(path, body){
+    return fetch(SB + '/auth/v1/' + path, {
+      method: 'POST',
+      headers: {'apikey': KEY, 'Content-Type': 'application/json'},
+      body: JSON.stringify(body)
+    }).then(function(r){ return r.json().then(function(j){ if (!r.ok) throw new Error(j.msg || j.error_description || j.message || 'Erro'); return j; }); });
+  }
+  function setSession(j){
+    session = {access_token: j.access_token, refresh_token: j.refresh_token,
+               expires_at: j.expires_at || (Math.floor(Date.now()/1000) + (j.expires_in || 3600)),
+               user: {id: j.user.id, email: j.user.email}};
+    lsSet(SES, session);
+  }
+  function freshToken(){
+    if (session.expires_at - 60 > Date.now()/1000) return Promise.resolve(session.access_token);
+    return authCall('token?grant_type=refresh_token', {refresh_token: session.refresh_token})
+      .then(function(j){ setSession(j); return session.access_token; });
+  }
+  function rest(path, opts){
+    opts = opts || {};
+    return freshToken().then(function(tok){
+      var h = {'apikey': KEY, 'Authorization': 'Bearer ' + tok, 'Content-Type': 'application/json'};
+      if (opts.prefer) h['Prefer'] = opts.prefer;
+      return fetch(SB + '/rest/v1/' + path, {method: opts.method || 'GET', headers: h, body: opts.body});
+    }).then(function(r){
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.status === 204 || r.status === 201 ? null : r.json();
+    });
+  }
+  function upsert(rows){
+    return rest('presencas', {method: 'POST', prefer: 'resolution=merge-duplicates,return=minimal',
+                              body: JSON.stringify(rows)});
+  }
+
+  function sync(){
+    if (!session) return Promise.resolve();
+    return rest('presencas?select=dia,hora&order=dia.desc&limit=1000').then(function(rows){
+      var server = {};
+      rows.forEach(function(r){ server[r.dia] = r.hora || '—'; });
+      var toPush = pending.filter(function(k){ return data[k]; }).map(function(k){ return {dia: k, hora: data[k]}; });
+      var done = toPush.length ? upsert(toPush) : Promise.resolve();
+      return done.then(function(){
+        toPush.forEach(function(r){ server[r.dia] = r.hora; });
+        data = server; pending = []; saveCache(); render();
+        say('Sincronizado.');
+      });
+    }).catch(function(){ say('Sem conexão. Seus registros ficam salvos aqui e serão enviados depois.'); });
+  }
+
+  /* ---------- Marcações ---------- */
+  function mark(k, hora){
+    data[k] = hora;
+    if (pending.indexOf(k) < 0) pending.push(k);
+    saveCache(); render();
+    upsert([{dia: k, hora: hora}]).then(function(){
+      pending = pending.filter(function(x){ return x !== k; }); saveCache(); say('Salvo e sincronizado.');
+    }).catch(function(){ say('Salvo no aparelho. Será enviado quando houver conexão.'); });
+  }
+  function unmark(k){
+    rest('presencas?dia=eq.' + k, {method: 'DELETE', prefer: 'return=minimal'}).then(function(){
+      delete data[k]; pending = pending.filter(function(x){ return x !== k; }); saveCache(); render(); say('Removido.');
+    }).catch(function(){ say('Não foi possível remover sem conexão. Tente de novo online.'); });
+  }
+
+  /* ---------- Tela ---------- */
   function tick(){
     var t = new Date();
     $('clock').textContent = pad(t.getHours()) + ':' + pad(t.getMinutes());
     $('today-label').textContent = t.toLocaleDateString('pt-BR', {weekday:'long', day:'numeric', month:'long'});
   }
-
   function render(){
-    var tk = todayKey();
-    var marked = !!data[tk];
-    var btn = $('mark');
+    var tk = todayKey(), marked = !!data[tk], btn = $('mark');
     btn.textContent = marked ? 'Presença marcada às ' + (data[tk] === '—' ? 'hoje' : data[tk]) : 'Marcar presença';
     btn.className = 'big' + (marked ? ' done' : '');
     btn.disabled = marked;
@@ -133,53 +223,74 @@ button:focus-visible{outline:3px solid var(--today);outline-offset:2px}
 
     var y = view.getFullYear(), m = view.getMonth();
     $('month-label').textContent = view.toLocaleDateString('pt-BR', {month:'long', year:'numeric'});
-    var first = new Date(y, m, 1).getDay();
-    var days = new Date(y, m + 1, 0).getDate();
+    var first = new Date(y, m, 1).getDay(), days = new Date(y, m + 1, 0).getDate();
     var html = WD.map(function(w){ return '<div class="wd">' + w + '</div>'; }).join('');
     for (var i = 0; i < first; i++) html += '<div></div>';
     var count = 0, items = [];
     for (var d = 1; d <= days; d++) {
-      var k = keyOf(y, m, d);
-      var on = !!data[k];
+      var k = keyOf(y, m, d), on = !!data[k];
       var future = new Date(y, m, d) > new Date(now.getFullYear(), now.getMonth(), now.getDate());
       if (on) { count++; items.push([d, k]); }
       html += '<button class="d' + (on ? ' on' : '') + (k === tk ? ' today' : '') + '" data-k="' + k + '"' +
               (future ? ' disabled' : '') + ' aria-pressed="' + on + '" aria-label="Dia ' + d + (on ? ', presente' : '') + '">' + d + '</button>';
     }
     $('grid').innerHTML = html;
-
     $('s-month').textContent = count;
     $('s-month-l').textContent = count === 1 ? 'dia neste mês' : 'dias neste mês';
     $('s-total').textContent = Object.keys(data).length;
-
     $('list').innerHTML = items.length ? items.reverse().map(function(it){
-      var dt = new Date(y, m, it[0]);
-      var w = dt.toLocaleDateString('pt-BR', {weekday:'long'});
+      var w = new Date(y, m, it[0]).toLocaleDateString('pt-BR', {weekday:'long'});
       return '<li><span>' + pad(it[0]) + '/' + pad(m + 1) + ' · ' + w + '</span><span>' + (data[it[1]] === '—' ? 'sem horário' : data[it[1]]) + '</span></li>';
     }).join('') : '<li class="empty">Nenhuma presença neste mês.</li>';
   }
 
+  function showApp(){
+    var c = lsGet(cacheKey());
+    if (c) { data = c.data || {}; pending = c.pending || []; }
+    else { // primeiro acesso neste aparelho: aproveita registros da versão antiga
+      var old = lsGet(LEGACY) || {};
+      data = old; pending = Object.keys(old); saveCache();
+    }
+    $('auth').hidden = true; $('app').hidden = false;
+    $('who').textContent = session.user.email;
+    render(); say('Sincronizando...'); sync();
+  }
+  function showAuth(){ session = null; $('app').hidden = true; $('auth').hidden = false; }
+
+  function enter(kind){
+    var email = $('email').value.trim(), pass = $('pass').value, msg = $('auth-msg');
+    if (!email || pass.length < 6) { msg.textContent = 'Informe o e-mail e uma senha de pelo menos 6 caracteres.'; return; }
+    msg.textContent = 'Aguarde...';
+    var p = kind === 'signup' ? authCall('signup', {email: email, password: pass})
+                              : authCall('token?grant_type=password', {email: email, password: pass});
+    p.then(function(j){
+      if (j.access_token) { setSession(j); msg.textContent = ''; showApp(); }
+      else msg.textContent = 'Conta criada. Abra o link enviado para o seu e-mail e depois toque em Entrar.';
+    }).catch(function(e){
+      msg.textContent = /Invalid login/i.test(e.message) ? 'E-mail ou senha incorretos.' : e.message;
+    });
+  }
+
+  /* ---------- Eventos ---------- */
+  $('login').addEventListener('click', function(){ enter('login'); });
+  $('signup').addEventListener('click', function(){ enter('signup'); });
+  $('logout').addEventListener('click', function(){ try { localStorage.removeItem(SES); } catch (e) {} showAuth(); });
   $('mark').addEventListener('click', function(){
-    var t = new Date();
-    data[todayKey()] = pad(t.getHours()) + ':' + pad(t.getMinutes());
-    save(); render();
+    var t = new Date(); mark(todayKey(), pad(t.getHours()) + ':' + pad(t.getMinutes()));
   });
-  $('undo').addEventListener('click', function(){ delete data[todayKey()]; save(); render(); });
+  $('undo').addEventListener('click', function(){ unmark(todayKey()); });
   $('grid').addEventListener('click', function(e){
     var b = e.target.closest('.d'); if (!b || b.disabled) return;
     var k = b.getAttribute('data-k');
-    if (data[k]) delete data[k]; else data[k] = '—';
-    save(); render();
+    if (data[k]) unmark(k); else mark(k, '—');
   });
   $('prev').addEventListener('click', function(){ view.setMonth(view.getMonth() - 1); render(); });
   $('next').addEventListener('click', function(){ view.setMonth(view.getMonth() + 1); render(); });
 
-  function say(t){ $('note').textContent = t; }
   $('export').addEventListener('click', function(){
     var blob = new Blob([JSON.stringify(data, null, 2)], {type:'application/json'});
     var a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = 'presenca-backup-' + todayKey() + '.json';
+    a.href = URL.createObjectURL(blob); a.download = 'presenca-backup-' + todayKey() + '.json';
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(function(){ URL.revokeObjectURL(a.href); }, 1000);
     say('Backup exportado.');
@@ -189,19 +300,23 @@ button:focus-visible{outline:3px solid var(--today);outline-offset:2px}
     var r = new FileReader();
     r.onload = function(){
       try {
-        var obj = JSON.parse(r.result), n = 0;
+        var obj = JSON.parse(r.result), rows = [];
         Object.keys(obj).forEach(function(k){
-          if (/^\d{4}-\d{2}-\d{2}$/.test(k) && typeof obj[k] === 'string') { data[k] = obj[k]; n++; }
+          if (/^\d{4}-\d{2}-\d{2}$/.test(k) && typeof obj[k] === 'string') { data[k] = obj[k]; rows.push({dia: k, hora: obj[k]}); if (pending.indexOf(k) < 0) pending.push(k); }
         });
-        save(); render(); say(n + ' registros importados.');
+        saveCache(); render(); say(rows.length + ' registros importados. Sincronizando...'); sync();
       } catch (err) { say('Arquivo inválido. Escolha um backup exportado por este app.'); }
       e.target.value = '';
     };
     r.readAsText(f);
   });
+  window.addEventListener('online', sync);
+  document.addEventListener('visibilitychange', function(){ if (!document.hidden) { tick(); sync(); } });
   if ('serviceWorker' in navigator) { navigator.serviceWorker.register('sw.js').catch(function(){}); }
 
-  tick(); setInterval(tick, 20000); render();
+  tick(); setInterval(tick, 20000);
+  var saved = lsGet(SES);
+  if (saved && saved.user) { session = saved; showApp(); } else showAuth();
 })();
 </script>
 </body>
